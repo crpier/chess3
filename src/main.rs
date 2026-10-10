@@ -1,6 +1,6 @@
 mod game;
 use anyhow::{Context, Result};
-use game::{Game, Hex, Kind, Move, Outcome, Piece, Side};
+use game::{CpuLevel, Game, Hex, Kind, Move, Outcome, Piece, Side};
 use raylib::prelude::*;
 use std::{collections::BTreeMap, ffi::CString, path::PathBuf};
 
@@ -60,7 +60,7 @@ impl Layout {
     }
     fn new(w: i32, h: i32) -> Self {
         Self {
-            center: Vector2::new((w - 340) as f32 / 2., h as f32 / 2. + 15.),
+            center: Vector2::new((w - 340) as f32 / 2., h as f32 / 2. + 25.),
             radius: (((w - 380) as f32 / 17.).min((h - 155) as f32 / 19.)).max(8.),
             panel_x: w - 320,
             width: w,
@@ -80,17 +80,16 @@ impl Layout {
                 * self.radius
                 * if flip { -1. } else { 1. }
     }
-    fn pick(self, game: &Game, p: Vector2, flip: bool) -> Option<Hex> {
+    fn pick(self, game: &Game, p: Vector2, flip: bool) -> Option<u64> {
         game.units()
             .iter()
             .filter_map(|u| {
                 let (q, r) = u.axial();
                 let distance = (self.fractional(q, r, flip) - p).length();
-                (distance < self.radius * 0.6).then_some((distance, u.anchor))
+                (distance < self.radius * 0.6).then_some((distance, u.id))
             })
             .min_by(|a, b| a.0.total_cmp(&b.0))
             .map(|(_, h)| h)
-            .or_else(|| self.hex(p, flip))
     }
     fn hex(self, p: Vector2, flip: bool) -> Option<Hex> {
         let sign = if flip { -1. } else { 1. };
@@ -120,14 +119,15 @@ enum Modal {
 }
 struct App {
     game: Game,
-    selected: Option<Hex>,
+    selected: Option<u64>,
     legal: Vec<Move>,
-    black_selected: Option<Hex>,
+    black_selected: Option<u64>,
     black_legal: Vec<Move>,
     black_cursor: Hex,
     inspected: Side,
     promotion: [Kind; 2],
     ai: bool,
+    cpu_level: CpuLevel,
     flip: bool,
     modal: Modal,
     paused: bool,
@@ -135,6 +135,7 @@ struct App {
     ai_wait: f32,
     fraction_ms: f64,
     notice: String,
+    notice_hold: f32,
 }
 impl App {
     fn new() -> Self {
@@ -148,17 +149,93 @@ impl App {
             inspected: Side::White,
             promotion: [Kind::Queen; 2],
             ai: true,
+            cpu_level: CpuLevel::Easy,
             flip: false,
             modal: Modal::None,
             paused: false,
             focus_paused: false,
             ai_wait: 0.,
             fraction_ms: 0.,
-            notice: "Both armies start together after 3 seconds.".into(),
+            notice: "Both sides start together after 3 seconds.".into(),
+            notice_hold: 0.,
+        }
+    }
+    fn pause_label(&self) -> Option<&'static str> {
+        if self.paused {
+            Some("Paused")
+        } else if self.modal != Modal::None {
+            Some("Paused: menu")
+        } else if self.focus_paused {
+            Some("Paused: focus lost")
+        } else {
+            None
         }
     }
     fn frozen(&self) -> bool {
-        self.paused || self.focus_paused || self.modal != Modal::None
+        self.pause_label().is_some()
+    }
+    fn can_start(&self, side: Side) -> bool {
+        !self.frozen()
+            && self.game.outcome == Outcome::Playing
+            && self.game.now() >= game::START_DELAY
+            && self.game.active(side) < game::MOVE_LIMIT
+    }
+    fn availability(&self, side: Side) -> String {
+        let state = if self.game.outcome != Outcome::Playing {
+            "game over".into()
+        } else if self.frozen() {
+            "wait / paused".into()
+        } else if self.game.now() < game::START_DELAY {
+            format!(
+                "wait / starts in {:.1}s",
+                (game::START_DELAY - self.game.now()).div_ceil(100) as f64 / 10.
+            )
+        } else if self.game.active(side) >= game::MOVE_LIMIT {
+            let remaining = self
+                .game
+                .units()
+                .iter()
+                .filter(|u| u.piece.side == side && u.marching())
+                .map(|u| u.remaining_ms())
+                .min()
+                .unwrap_or(0);
+            format!(
+                "wait / slot in {:.1}s",
+                remaining.div_ceil(100) as f64 / 10.
+            )
+        } else {
+            format!(
+                "ready / {} free slots",
+                game::MOVE_LIMIT - self.game.active(side)
+            )
+        };
+        format!("{}: {}", side.name(), state)
+    }
+    fn travel_hint(&self, u: &game::Unit) -> Option<String> {
+        if self.game.outcome != Outcome::Playing {
+            return None;
+        }
+        let seconds = |ms: u64| ms.div_ceil(100) as f64 / 10.;
+        if let Some(to) = u.waypoints().last() {
+            Some(format!(
+                "{} / {:.1}s planned travel{}",
+                to.label(),
+                seconds(u.remaining_ms()),
+                u.promoting_to()
+                    .map_or(String::new(), |kind| format!(" / {}", kind.name()))
+            ))
+        } else if self.game.active(u.piece.side) >= game::MOVE_LIMIT {
+            let first = self
+                .game
+                .units()
+                .iter()
+                .filter(|other| other.piece.side == u.piece.side && other.marching())
+                .map(|other| other.remaining_ms())
+                .min()?;
+            Some(format!("Next slot: {:.1}s planned travel", seconds(first)))
+        } else {
+            None
+        }
     }
     fn clear_selection(&mut self) {
         self.selected = None;
@@ -167,34 +244,62 @@ impl App {
         self.black_legal.clear();
     }
     fn reset(&mut self) {
-        let (ai, flip) = (self.ai, self.flip);
+        let (ai, flip, cpu_level) = (self.ai, self.flip, self.cpu_level);
         *self = Self::new();
         self.ai = ai;
         self.flip = flip;
+        self.cpu_level = cpu_level;
     }
-    fn play(&mut self, mv: Move) {
-        match self.game.submit(mv) {
+    fn cycle_cpu(&mut self) {
+        self.cpu_level = self.cpu_level.next();
+        self.ai_wait = 0.;
+        self.feedback(format!(
+            "CPU: {}. Existing moves still finish; new decisions use this level.",
+            self.cpu_level.name()
+        ));
+    }
+    fn feedback(&mut self, text: impl Into<String>) {
+        self.notice = text.into();
+        self.notice_hold = 1.5;
+    }
+    fn play(&mut self, id: u64, mv: Move) {
+        let piece = self.game.unit(id).map(|u| u.piece);
+        match self.game.submit(id, mv) {
             Ok(()) => {
-                let side = self.game.position.pieces[&mv.from].side;
-                self.notice = format!(
-                    "{} ordered {} toward {}.",
-                    side.name(),
-                    self.game.position.pieces[&mv.from].kind.name(),
-                    mv.to.label()
-                );
-                if side == Side::White {
-                    self.selected = None;
-                    self.legal.clear();
-                } else {
-                    self.black_selected = None;
-                    self.black_legal.clear();
+                if let Some(p) = piece {
+                    self.feedback(format!(
+                        "{} {} committed to {}.",
+                        p.side.name(),
+                        p.kind.name(),
+                        mv.to.label()
+                    ));
                 }
+                self.refresh_selection();
             }
-            Err(reason) => self.notice = reason.message().into(),
+            Err(reason) => self.feedback(format!(
+                "{}{}",
+                piece.map_or(String::new(), |p| format!("{}: ", p.side.name())),
+                reason.message()
+            )),
         }
     }
     fn click_hex(&mut self, hex: Option<Hex>) {
         self.click_side(Side::White, hex);
+    }
+    fn select(&mut self, side: Side, id: Option<u64>) {
+        let previous = if side == Side::White {
+            self.selected
+        } else {
+            self.black_selected
+        };
+        let next = id.filter(|id| Some(*id) != previous);
+        if side == Side::White {
+            self.selected = next;
+        } else {
+            self.black_selected = next;
+        }
+        self.inspected = side;
+        self.refresh_selection();
     }
     fn click_side(&mut self, side: Side, hex: Option<Hex>) {
         if self.frozen()
@@ -203,125 +308,146 @@ impl App {
         {
             return;
         }
+        let Some(h) = hex else {
+            if side == Side::White {
+                self.selected = None;
+            } else {
+                self.black_selected = None;
+            }
+            self.refresh_selection();
+            return;
+        };
+        if let Some(id) = self
+            .game
+            .units()
+            .iter()
+            .find(|u| u.piece.side == side && u.tile() == h)
+            .map(|u| u.id)
+        {
+            self.select(side, Some(id));
+        } else if !self.order_to(side, h) {
+            self.feedback(format!(
+                "{}: choose a legal destination. Nothing is queued.",
+                side.name()
+            ));
+        }
+    }
+    /// Physical hits carry stable identity, not a vacated or shared waypoint key.
+    fn click_pointer(&mut self, hit: Option<u64>, tile: Option<Hex>) {
+        if self.frozen() || self.game.outcome != Outcome::Playing {
+            return;
+        }
+        if let Some(u) = hit.and_then(|id| self.game.unit(id))
+            && u.piece.side == Side::White
+        {
+            let id = u.id;
+            self.select(Side::White, Some(id));
+            return;
+        }
+        let destination = hit
+            .and_then(|id| self.game.unit(id))
+            .map(|u| u.tile())
+            .or(tile);
+        if let Some(to) = destination {
+            if !self.order_to(Side::White, to) {
+                self.feedback("Choose a piece and a legal destination.");
+            }
+        } else {
+            self.selected = None;
+            self.refresh_selection();
+        }
+    }
+    fn order_to(&mut self, side: Side, to: Hex) -> bool {
         let selected = if side == Side::White {
             self.selected
         } else {
             self.black_selected
         };
-        let Some(hex) = hex else {
-            if side == Side::White {
-                self.selected = None;
-                self.legal.clear();
-            } else {
-                self.black_selected = None;
-                self.black_legal.clear();
-            }
-            return;
+        let Some(id) =
+            selected.filter(|&id| self.game.unit(id).is_some_and(|u| u.piece.side == side))
+        else {
+            return false;
         };
-        // Revalidate against the live board, not yesterday's highlighted destinations.
-        if let Some(from) = selected.filter(|h| {
-            self.game
-                .position
-                .pieces
-                .get(h)
-                .is_some_and(|p| p.side == side)
-        }) {
-            let promotion = self.promotion[if side == Side::White { 0 } else { 1 }];
-            if let Some(mut mv) = self
-                .game
-                .legal_from(from)
-                .into_iter()
-                .find(|m| m.to == hex && m.promotion.is_none_or(|k| k == promotion))
-            {
-                if self.game.position.pieces[&from].kind == Kind::Pawn {
-                    mv.promotion = Some(promotion);
-                }
-                self.play(mv);
-                return;
-            }
-        }
-        if self
-            .game
-            .position
-            .pieces
-            .get(&hex)
-            .is_some_and(|p| p.side == side)
-        {
-            let next = (selected != Some(hex)).then_some(hex);
-            self.inspected = side;
-            if side == Side::White {
-                self.selected = next;
-            } else {
-                self.black_selected = next;
-            }
-
-            self.notice = format!(
-                "{} {} at {}: {}",
+        self.inspected = side;
+        if self.game.unit(id).unwrap().marching() {
+            self.feedback(format!(
+                "{}: {}",
                 side.name(),
-                self.game.position.pieces[&hex].kind.name(),
-                hex.label(),
-                "choose a destination, even far away."
-            );
-            self.refresh_selection();
-        } else {
-            self.notice =
-                "Select your piece, then a destination. Rejected clicks are never queued.".into();
+                game::Rejection::Committed.message()
+            ));
+            return true;
         }
+        if self.game.active(side) >= game::MOVE_LIMIT {
+            self.feedback(format!(
+                "{}: {}",
+                side.name(),
+                game::Rejection::Full.message()
+            ));
+            return true;
+        }
+        let choice = self.promotion[usize::from(side == Side::Black)];
+        let Some(mv) = self
+            .game
+            .legal_from(id)
+            .into_iter()
+            .find(|m| m.to == to && m.promotion.is_none_or(|k| k == choice))
+        else {
+            return false;
+        };
+        self.play(id, mv);
+        true
     }
     fn refresh_selection(&mut self) {
-        if self.selected.is_some_and(|h| {
-            !self
-                .game
-                .position
-                .pieces
-                .get(&h)
-                .is_some_and(|p| p.side == Side::White)
-        }) {
-            self.selected = None;
-        }
-        if self.black_selected.is_some_and(|h| {
-            !self
-                .game
-                .position
-                .pieces
-                .get(&h)
-                .is_some_and(|p| p.side == Side::Black)
-        }) {
-            self.black_selected = None;
-        }
-        self.legal = self.selected.map_or(vec![], |h| self.game.legal_from(h));
+        self.selected = self.selected.filter(|&id| {
+            self.game
+                .unit(id)
+                .is_some_and(|u| u.piece.side == Side::White)
+        });
+        self.black_selected = self.black_selected.filter(|&id| {
+            self.game
+                .unit(id)
+                .is_some_and(|u| u.piece.side == Side::Black)
+        });
+        self.legal = self.selected.map_or(vec![], |id| self.game.legal_from(id));
         self.black_legal = self
             .black_selected
-            .map_or(vec![], |h| self.game.legal_from(h));
+            .map_or(vec![], |id| self.game.legal_from(id));
     }
     fn update(&mut self, dt: f32) {
         if self.frozen() {
             return;
         }
+        let had_feedback = self.notice_hold > 0.;
+        self.notice_hold = (self.notice_hold - dt).max(0.);
         self.fraction_ms += dt as f64 * 1000.;
         let ms = self.fraction_ms.floor() as u64;
         self.fraction_ms -= ms as f64;
-        let white = self
-            .selected
-            .and_then(|h| self.game.unit_at(h))
-            .map(|u| u.id);
-        let black = self
-            .black_selected
-            .and_then(|h| self.game.unit_at(h))
-            .map(|u| u.id);
         let previous = self.game.moves.len();
         self.game.advance(ms);
-        self.selected = white.and_then(|id| self.game.hex_of(id));
-        self.black_selected = black.and_then(|id| self.game.hex_of(id));
-        if self.game.moves.len() != previous {
-            self.notice = self.game.moves.last().cloned().unwrap_or_default();
+
+        let event = self.game.moves.len() != previous;
+        if self.game.outcome != Outcome::Playing {
+            self.notice_hold = 0.;
+            if event {
+                self.notice = self.game.moves.last().cloned().unwrap_or_default();
+            }
+        } else if self.notice_hold == 0. && (event || had_feedback) {
+            self.notice = self
+                .game
+                .moves
+                .last()
+                .cloned()
+                .unwrap_or_else(|| "Choose a piece, then a destination.".into());
         }
         self.refresh_selection();
-        if self.ai && self.game.outcome == Outcome::Playing {
+        if self.ai && self.game.outcome == Outcome::Playing && self.game.now() >= game::START_DELAY
+        {
             self.ai_wait += dt;
-            if self.ai_wait >= 0.35 {
+            if self.ai_wait >= self.cpu_level.decision_seconds() {
                 self.ai_wait = 0.;
-                self.game.attack_army(Side::Black);
+                if let Some((id, mv)) = self.game.cpu_move(Side::Black, self.cpu_level) {
+                    let _ = self.game.submit(id, mv);
+                }
             }
         }
     }
@@ -555,19 +681,24 @@ fn draw(
         return;
     }
     d.draw_text("Hex Chess", 30, 24, 30, TEXT);
-    d.draw_text("March. Engage. Reinforce.", 31, 62, 17, MUTED);
+    d.draw_text("Two simultaneous moves per side", 31, 62, 17, MUTED);
     let hover = if app.modal == Modal::None {
         l.hex(mouse, app.flip)
     } else {
         None
     };
-    let white_ready = !app.frozen() && app.game.now() >= game::START_DELAY;
-    let black_ready = white_ready;
-    let checked = app
-        .game
-        .units()
-        .iter()
-        .any(|u| u.piece.kind == Kind::King && u.health < u.piece.kind.stats().health * 0.5);
+    let white_ready = app.can_start(Side::White);
+    let black_ready = app.can_start(Side::Black);
+    let danger = [
+        app.game.king_in_danger(Side::White),
+        app.game.king_in_danger(Side::Black),
+    ];
+    let checked = danger[0] || danger[1];
+    let mut feedback = app.notice.clone();
+    while d.measure_text(&feedback, 14) > l.panel_x - 65 {
+        feedback.pop();
+    }
+    d.draw_text(&feedback, 31, 84, 14, MUTED);
     for q in -5..=5 {
         for r in -5..=5 {
             let h = Hex::new(q, r);
@@ -581,24 +712,21 @@ fn draw(
                 Color::new(128, 110, 87, 255),
             ];
             let mut color = palette[(q - r).rem_euclid(3) as usize];
-            if app.game.last_move.is_some_and(|m| m.from == h || m.to == h) {
-                color = Color::new(150, 166, 112, 255);
-            }
             if hover == Some(h) {
                 color = color.brightness(0.12);
             }
-            if app.selected == Some(h) {
-                color = Color::new(76, 151, 149, 255);
-            }
-            if app.black_selected == Some(h) {
-                color = Color::new(57, 100, 146, 255);
-            }
-            if app.game.unit_at(h).is_some_and(|u| {
-                u.piece.kind == Kind::King && u.health < u.piece.kind.stats().health * 0.5
-            }) {
+            if app
+                .game
+                .position
+                .pieces
+                .get(&h)
+                .is_some_and(|p| p.kind == Kind::King && danger[usize::from(p.side == Side::Black)])
+            {
                 color = Color::new(186, 87, 81, 255);
             }
             d.draw_poly(p, 6, l.radius - 0.7, 0., color);
+            // Show the entire legal set, not just the destination under the cursor.
+            // A muted preview remains useful for planning while both slots are busy.
             let white_target = app.legal.iter().any(|m| m.to == h);
             let black_target = app.black_legal.iter().any(|m| m.to == h);
             if white_target || black_target {
@@ -612,7 +740,9 @@ fn draw(
                 if app.game.position.pieces.contains_key(&h) {
                     d.draw_poly_lines_ex(p, 6, l.radius - 3., 0., 3., tint);
                 } else {
-                    d.draw_circle_v(p, l.radius * 0.14, tint);
+                    let considered = (white_target && hover == Some(h))
+                        || (black_target && app.black_cursor == h);
+                    d.draw_circle_v(p, l.radius * if considered { 0.19 } else { 0.12 }, tint);
                 }
                 if white_target && black_target {
                     d.draw_circle_lines(
@@ -642,51 +772,33 @@ fn draw(
     }
     // Physical positions are canonical. Grid anchors are only routing waypoints.
     for order in app.game.orders() {
-        if let Some(u) = app.game.unit_at(order.mv.from) {
+        if let Some(u) = app.game.unit(order.id) {
             let (q, r) = u.axial();
-            let from = l.fractional(q, r, app.flip);
-            let to = l.point(order.mv.to, app.flip);
+            let mut from = l.fractional(q, r, app.flip);
             let tint = if order.piece.side == Side::White {
                 GOLD
             } else {
                 Color::new(134, 181, 240, 255)
             };
-            let selected = app.selected == Some(u.anchor) || app.black_selected == Some(u.anchor);
-            if selected {
-                d.draw_line_ex(from, to, 1., tint.alpha(0.65));
+            for h in u.waypoints() {
+                let to = l.point(h, app.flip);
+                d.draw_line_ex(from, to, 1.5, tint.alpha(0.65));
+                from = to;
             }
             d.draw_poly_lines_ex(
-                to,
+                l.point(order.mv.to, app.flip),
                 6,
-                l.radius * 0.18,
+                l.radius * 0.22,
                 0.,
-                1.,
-                tint.alpha(if selected { 1. } else { 0.35 }),
+                1.5,
+                tint,
             );
         }
     }
     for u in app.game.units() {
         let (q, r) = u.axial();
         let p = l.fractional(q, r, app.flip);
-        for (id, healing) in [(u.target, false), (u.healing, true)] {
-            if let Some(v) = id.and_then(|id| app.game.units().iter().find(|v| v.id == id)) {
-                let (q, r) = v.axial();
-                let to = l.fractional(q, r, app.flip);
-                let tint = if healing {
-                    ACCENT
-                } else if u.piece.side == Side::White {
-                    GOLD
-                } else {
-                    Color::new(134, 181, 240, 255)
-                };
-                d.draw_line_ex(p, to, if healing { 1. } else { 2. }, tint.alpha(0.65));
-            }
-        }
-    }
-    for u in app.game.units() {
-        let (q, r) = u.axial();
-        let p = l.fractional(q, r, app.flip);
-        if app.selected == Some(u.anchor) || app.black_selected == Some(u.anchor) {
+        if app.selected == Some(u.id) || app.black_selected == Some(u.id) {
             d.draw_circle_lines(
                 p.x as i32,
                 p.y as i32,
@@ -699,20 +811,6 @@ fn draw(
             );
         }
         draw_piece(d, textures, u.piece, p, l.radius);
-        let width = l.radius * 0.8;
-        let y = p.y + l.radius * 0.66;
-        d.draw_rectangle((p.x - width / 2.) as i32, y as i32, width as i32, 4, PANEL);
-        d.draw_rectangle(
-            (p.x - width / 2.) as i32,
-            y as i32,
-            (width * (u.health / u.piece.kind.stats().health) as f32) as i32,
-            4,
-            if u.health / u.piece.kind.stats().health < 0.3 {
-                Color::new(237, 107, 101, 255)
-            } else {
-                ACCENT
-            },
-        );
     }
     if !app.ai {
         d.draw_poly_lines_ex(
@@ -726,19 +824,22 @@ fn draw(
     }
     let x = l.panel_x;
     d.draw_rectangle(x - 15, 20, 310, l.height - 40, PANEL);
-    d.draw_text(
-        if app.ai {
-            "Solo / simple bot"
-        } else {
-            "Local / two players"
-        },
-        x,
-        40,
-        18,
-        ACCENT,
-    );
+    if app.ai {
+        if button(
+            d,
+            Rectangle::new(x as f32, 32., 270., 34.),
+            &format!("CPU: {} / change [C]", app.cpu_level.name()),
+            mouse,
+            click,
+            app.modal == Modal::None,
+        ) {
+            app.cycle_cpu();
+        }
+    } else {
+        d.draw_text("Local / two players", x, 40, 18, ACCENT);
+    }
     let status = match &app.game.outcome {
-        Outcome::Playing if app.frozen() => "Paused".into(),
+        Outcome::Playing if app.frozen() => app.pause_label().unwrap().into(),
         Outcome::Playing if app.game.now() < game::START_DELAY => format!(
             "Starts in {:.1}s",
             (game::START_DELAY - app.game.now()) as f32 / 1000.
@@ -748,7 +849,7 @@ fn draw(
             app.game.now() / 60000,
             (app.game.now() / 1000) % 60
         ),
-        Outcome::KingDefeated(side) | Outcome::Resigned(side) => format!("{} wins!", side.name()),
+        Outcome::KingCaptured(side) | Outcome::Resigned(side) => format!("{} wins!", side.name()),
         Outcome::Draw(_) => "Draw".into(),
     };
     d.draw_text(&status, x, 80, 26, if checked { GOLD } else { TEXT });
@@ -756,7 +857,7 @@ fn draw(
         wrapped(
             d,
             match &app.game.outcome {
-                Outcome::KingDefeated(_) => "King defeated. Start a new game to play again.",
+                Outcome::KingCaptured(_) => "King captured. Start a new game to play again.",
                 Outcome::Resigned(_) => "By resignation. Start a new game to play again.",
                 Outcome::Draw(reason) => reason,
                 _ => "",
@@ -769,55 +870,77 @@ fn draw(
         );
     } else {
         for (i, side) in [Side::White, Side::Black].into_iter().enumerate() {
-            let marching = app
-                .game
-                .units()
-                .iter()
-                .filter(|u| u.piece.side == side && u.marching())
-                .count();
-            let fighting = app
-                .game
-                .units()
-                .iter()
-                .filter(|u| u.piece.side == side && u.target.is_some())
-                .count();
-            let state = format!("{marching} marching / {fighting} fighting");
+            let state = format!(
+                "{}/{} moves in flight",
+                app.game.active(side),
+                game::MOVE_LIMIT
+            );
             d.draw_text(
                 &format!("{}: {}", side.name(), state),
                 x,
                 116 + i as i32 * 25,
                 17,
-                ACCENT,
+                if app.can_start(side) { ACCENT } else { GOLD },
             );
+            // One light per independent slot: gold is in flight, mint is available.
+            for slot in 0..game::MOVE_LIMIT {
+                let tint = if slot < app.game.active(side) {
+                    GOLD
+                } else if app.can_start(side) {
+                    ACCENT
+                } else {
+                    MUTED
+                };
+                d.draw_rectangle(
+                    x + 263 + slot as i32 * 15,
+                    121 + i as i32 * 25,
+                    10,
+                    10,
+                    tint,
+                );
+            }
         }
+    }
+    if checked {
+        let warning = match danger {
+            [true, true] => "Threat: both kings",
+            [true, false] => "Threat: White king",
+            _ => "Threat: Black king",
+        };
+        d.draw_text(warning, x, 163, 14, GOLD);
     }
     let inspected = if app.inspected == Side::White {
         app.selected.or(app.black_selected)
     } else {
         app.black_selected.or(app.selected)
-    }
-    .and_then(|h| app.game.position.pieces.get(&h).map(|p| (h, *p)));
+    };
+    let inspected = inspected.and_then(|id| app.game.unit(id));
     d.draw_text(
-        if inspected.is_some() {
-            "Selected unit"
-        } else {
-            "Last action"
+        match inspected.map(|u| u.piece.side) {
+            Some(Side::White) => "White piece",
+            Some(Side::Black) => "Black piece",
+            None => "Last action",
         },
         x,
         180,
         16,
         ACCENT,
     );
-    let hint = inspected.and_then(|(h, p)| {
-        app.game.unit_at(h).map(|u| {
-            format!(
-                "{} {:.0}/{:.0} HP. {}",
-                p.kind.name(),
-                u.health,
-                p.kind.stats().health,
-                p.kind.movement()
-            )
-        })
+    let hint = inspected.map(|u| {
+        format!(
+            "{} {}. {}",
+            u.piece.kind.name(),
+            if app.game.outcome != Outcome::Playing {
+                "(game over)"
+            } else if u.marching() {
+                "(committed)"
+            } else if !app.can_start(u.piece.side) {
+                "(waiting)"
+            } else {
+                "(ready)"
+            },
+            u.piece.kind.movement()
+        )
     });
     wrapped(
         d,
@@ -828,6 +951,9 @@ fn draw(
         17,
         TEXT,
     );
+    if let Some(hint) = inspected.and_then(|u| app.travel_hint(u)) {
+        d.draw_text(&hint, x, 258, 14, MUTED);
+    }
     let lost_white = app.game.captured_count(Side::White);
     let lost_black = app.game.captured_count(Side::Black);
     d.draw_text(
@@ -837,7 +963,18 @@ fn draw(
         17,
         MUTED,
     );
-    d.draw_text("Battle log", x, 323, 16, ACCENT);
+    d.draw_text(
+        &app.availability(app.inspected),
+        x,
+        299,
+        16,
+        if app.can_start(app.inspected) {
+            ACCENT
+        } else {
+            GOLD
+        },
+    );
+    d.draw_text("Move log", x, 323, 16, ACCENT);
     let log_rows = ((l.height - 610) / 27).clamp(2, 9) as usize;
     let start = app.game.moves.len().saturating_sub(log_rows);
     for (i, line) in app.game.moves.iter().enumerate().skip(start) {
@@ -943,7 +1080,7 @@ fn draw(
     );
     d.draw_text(
         if app.ai {
-            "A: advance / S: stop / Q: quit"
+            "2 move slots / Esc: clear / Q: quit"
         } else {
             "Black: arrows + , . / Space"
         },
@@ -971,42 +1108,38 @@ fn draw(
 }
 fn draw_movement_guide(d: &mut Canvas<'_, '_>, x: i32, y: i32) {
     d.draw_text(
-        "Green = attack range. Blue = healing. Bodies block ranged fire.",
+        "Green = legal destinations on an empty board. White pawns face up.",
         x + 28,
         y + 65,
         15,
         MUTED,
     );
     let cards = [
-        (
-            Kind::King,
-            "Commander / 180 HP",
-            "Protect him to stay alive",
-        ),
+        (Kind::King, "One touching tile", "Protect him; capture wins"),
         (
             Kind::Bishop,
-            "Heal 4 HP/s within 2 tiles",
-            "Weak melee / mobile support",
+            "Walk up to two tiles",
+            "May turn; cannot jump",
         ),
         (
             Kind::Knight,
-            "Fast march / melee fighter",
-            "Vaults over friendly traffic",
+            "Jump to the second ring",
+            "Ignore intervening pieces",
         ),
         (
             Kind::Rook,
-            "22 damage/s / range 3.2",
-            "Slow / needs clear sightline",
+            "Slide along a straight row",
+            "Stop at the first piece",
         ),
         (
             Kind::Queen,
-            "24 damage/s / range 2.6",
-            "Mobile ranged support",
+            "Rook + bishop movement",
+            "Long slides or short walks",
         ),
         (
             Kind::Pawn,
-            "18 damage/s / close range",
-            "Forward march / frontline",
+            "One step into the front fan",
+            "Move and capture alike",
         ),
     ];
     for (i, (kind, line1, line2)) in cards.into_iter().enumerate() {
@@ -1015,6 +1148,18 @@ fn draw_movement_guide(d: &mut Canvas<'_, '_>, x: i32, y: i32) {
         d.draw_rectangle(cx, cy, 198, 224, Color::new(35, 47, 58, 255));
         d.draw_text(kind.name(), cx + 12, cy + 10, 19, TEXT);
         let center = Vector2::new((cx + 99) as f32, (cy + 104) as f32);
+        let board = game::Position {
+            pieces: [(
+                Hex::new(0, 0),
+                Piece {
+                    side: Side::White,
+                    kind,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let reach = board.legal_from(Hex::new(0, 0));
         for q in -3..=3 {
             for r in -3..=3 {
                 let h = Hex::new(q, r);
@@ -1025,27 +1170,12 @@ fn draw_movement_guide(d: &mut Canvas<'_, '_>, x: i32, y: i32) {
                     + Vector2::new(1.5 * q as f32, SQRT3 * (r as f32 + q as f32 / 2.)) * 10.5;
                 let tint = if h == Hex::new(0, 0) {
                     GOLD
-                } else if ((q * q + q * r + r * r) as f64).sqrt() <= kind.stats().range {
+                } else if reach.iter().any(|m| m.to == h) {
                     ACCENT
                 } else {
                     Color::new(53, 68, 78, 255)
                 };
                 d.draw_poly(p, 6, 9.8, 0., tint);
-            }
-        }
-        if kind == Kind::Bishop {
-            for q in -2..=2 {
-                for r in -2..=2 {
-                    if q == 0 && r == 0 {
-                        continue;
-                    }
-                    if ((q * q + q * r + r * r) as f64).sqrt() > 2.1 {
-                        continue;
-                    }
-                    let p = center
-                        + Vector2::new(1.5 * q as f32, SQRT3 * (r as f32 + q as f32 / 2.)) * 10.5;
-                    d.draw_poly_lines_ex(p, 6, 9.8, 0., 1., Color::new(134, 181, 240, 255));
-                }
             }
         }
         d.draw_circle_v(center, 3.5, PANEL);
@@ -1078,7 +1208,7 @@ fn draw_modal(
         Modal::Mode => "Switch mode and start fresh?",
         Modal::Resign(Side::White) => "Resign White?",
         Modal::Resign(Side::Black) => "Resign Black?",
-        Modal::Movement => "Army roles and combat reach",
+        Modal::Movement => "How the pieces move",
         _ => "Choose your promotion",
     };
     d.draw_text(title, x + 28, y + 28, 26, TEXT);
@@ -1089,28 +1219,28 @@ fn draw_modal(
             } else {
                 let lines = [
                     (
-                        "A BATTLE, NOT TIMED TURNS",
-                        "All pieces move and fight together. Reduce the enemy king to zero health. Orders set destinations, not individual attacks.",
+                        "REAL-TIME HEX CHESS",
+                        "Capture the enemy king. Both sides begin together after 3 seconds. Pieces travel continuously; this is not an automatic army battle.",
                     ),
                     (
-                        "PERSISTENT ORDERS / A TO ADVANCE",
-                        "Click a piece and any reachable tile. It keeps marching there. A sends the whole army to seek enemies; Shift+A for Black in local play.",
+                        "TWO COMMITTED MOVES PER SIDE",
+                        "Only two of your pieces may be travelling at once. Each finishes its play before its slot is free. Repeated clicks never add a queue.",
                     ),
                     (
-                        "AUTOMATIC COMBAT",
-                        "Nearby enemies fight continuously, even when you give no orders. Rooks and queens need clear sightlines. Bishops heal one nearby ally.",
+                        "NO CANCEL OR RETARGET SPAM",
+                        "Choose carefully: a travelling piece cannot be redirected or stopped. Keep a slot free for defense. No cooldown after a piece arrives.",
                     ),
                     (
-                        "MOVEMENT / TRAFFIC",
-                        "Routes follow touching tiles. Pawns can only advance into their front fan. Knights vault friendly traffic. Other pieces walk around bodies.",
+                        "CAPTURES / INTERCEPTION",
+                        "No damage, healing or automatic fire. Captures complete at landing. Crossing ground moves capture each other. Ordinary steps take 1.2s; king steps 0.8s; knight jumps 1.2s.",
                     ),
                     (
-                        "RETREAT / NO CLICK-SPAM BONUS",
-                        "Retarget at any time; velocity turns gradually. S stops a selected unit (Shift+S Black). Clicks never reset momentum, health or damage.",
+                        "MOVEMENT / PROMOTION",
+                        "Each piece has its own hex movement pattern. Friendly travel lanes are reserved. Pawns promote at the far rim; 1-4 sets the next choice (Shift for Black).",
                     ),
                     (
-                        "LOCAL PLAY / PAUSE / PROMOTION",
-                        "White mouse; Black arrows and Space. P, menus and focus loss pause. 1-4 preset promotion at the far rim (Shift for Black). Q quits.",
+                        "LOCAL PLAY / PAUSE",
+                        "White: mouse. Black: arrows, comma/period and Space. P, menus and focus loss pause. Check is a warning, not a forced response. Q quits.",
                     ),
                 ];
                 for (i, (heading, body)) in lines.iter().enumerate() {
@@ -1123,9 +1253,9 @@ fn draw_modal(
                 d,
                 Rectangle::new((x + 28) as f32, (y + h - 57) as f32, 180., 36.),
                 if app.modal == Modal::Movement {
-                    "Battle rules"
+                    "Game rules"
                 } else {
-                    "Army guide"
+                    "Piece movement"
                 },
                 mouse,
                 click,
@@ -1300,6 +1430,9 @@ fn main() -> Result<()> {
             if rl.is_key_pressed(KeyboardKey::KEY_N) {
                 app.modal = Modal::NewGame;
             }
+            if app.ai && rl.is_key_pressed(KeyboardKey::KEY_C) {
+                app.cycle_cpu();
+            }
             if rl.is_key_pressed(KeyboardKey::KEY_M) {
                 app.modal = Modal::Mode;
             }
@@ -1327,11 +1460,11 @@ fn main() -> Result<()> {
                     app.promotion[usize::from(black)] = kind;
                     app.game
                         .set_promotion(if black { Side::Black } else { Side::White }, kind);
-                    app.notice = format!(
+                    app.feedback(format!(
                         "{} promotion preset: {}",
                         if black { "Black" } else { "White" },
                         kind.name()
-                    );
+                    ));
                 }
             }
             if !app.ai && !app.frozen() {
@@ -1360,22 +1493,7 @@ fn main() -> Result<()> {
                 }
             }
             if click && mouse.x < (l.panel_x - 20) as f32 {
-                app.click_hex(l.pick(&app.game, mouse, app.flip));
-            }
-            let black = rl.is_key_down(KeyboardKey::KEY_LEFT_SHIFT)
-                || rl.is_key_down(KeyboardKey::KEY_RIGHT_SHIFT);
-            if rl.is_key_pressed(KeyboardKey::KEY_A) && (!black || !app.ai) {
-                app.game
-                    .attack_army(if black { Side::Black } else { Side::White });
-            }
-            if rl.is_key_pressed(KeyboardKey::KEY_S)
-                && let Some(h) = if black {
-                    app.black_selected
-                } else {
-                    app.selected
-                }
-            {
-                app.game.stop(h);
+                app.click_pointer(l.pick(&app.game, mouse, app.flip), l.hex(mouse, app.flip));
             }
             if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_RIGHT) {
                 app.selected = None;
@@ -1409,6 +1527,26 @@ fn main() -> Result<()> {
                 mouse,
                 draw_click,
             );
+            if demo && l.usable() {
+                let fixture = match frame {
+                    900..=1139 => Some("Audit fixture: promotion (artificial position)"),
+                    1140..=1619 => Some("Audit fixture: king capture (artificial position)"),
+                    _ => None,
+                };
+                if let Some(label) = fixture {
+                    Canvas {
+                        draw: &mut d,
+                        font: &font,
+                    }
+                    .draw_text(
+                        label,
+                        80,
+                        h - 25,
+                        14,
+                        Color::new(168, 190, 199, 255),
+                    );
+                }
+            }
         }
         if let Some(path) = &capture
             && ((!capture_on_demand && frame % 3 == 0)
@@ -1448,7 +1586,8 @@ fn demo_step(app: &mut App, frame: u32) {
     match frame {
         200 => app.click_hex(Some(Hex::new(0, 4))),
         230 => app.click_hex(Some(Hex::new(0, 3))),
-        240 => app.game.attack_army(Side::White),
+        240 => app.click_hex(Some(Hex::new(1, 3))),
+        260 => app.click_hex(Some(Hex::new(1, 2))),
         400 => {
             let source = app
                 .game
@@ -1554,8 +1693,7 @@ fn demo_step(app: &mut App, frame: u32) {
                 .collect(),
             });
             app.game.advance(game::START_DELAY);
-            app.notice = "Visual fixture: continuous damage defeats the king.".into();
-            app.game.attack_army(Side::White);
+            app.notice = "Visual fixture: chess capture wins; no damage or health.".into();
         }
         1160 => app.click_hex(Some(Hex::new(0, -4))),
         1180 => app.click_hex(Some(Hex::new(0, -5))),
@@ -1568,6 +1706,32 @@ fn demo_step(app: &mut App, frame: u32) {
 mod tests {
     use super::*;
     #[test]
+    fn pause_reason_is_explicit_and_matches_the_simulation_gate() {
+        let mut app = App::new();
+        for mask in 0..8 {
+            app.paused = mask & 1 != 0;
+            app.modal = if mask & 2 != 0 {
+                Modal::Help
+            } else {
+                Modal::None
+            };
+            app.focus_paused = mask & 4 != 0;
+            assert_eq!(app.frozen(), mask != 0);
+            assert_eq!(
+                app.pause_label(),
+                if mask & 1 != 0 {
+                    Some("Paused")
+                } else if mask & 2 != 0 {
+                    Some("Paused: menu")
+                } else if mask & 4 != 0 {
+                    Some("Paused: focus lost")
+                } else {
+                    None
+                }
+            );
+        }
+    }
+    #[test]
     fn all_tile_centers_round_trip_both_orientations() {
         for (w, h) in [(1280, 900), (1024, 768), (1600, 1000)] {
             let l = Layout::new(w, h);
@@ -1579,6 +1743,35 @@ mod tests {
                             assert_eq!(l.hex(l.point(hex, flip), flip), Some(hex));
                         }
                     }
+                }
+            }
+        }
+    }
+    #[test]
+    fn board_stays_clear_of_command_feedback_and_footer_at_playable_sizes() {
+        for (w, h) in [
+            (1000, 640),
+            (1000, 740),
+            (1280, 900),
+            (1920, 1080),
+            (2560, 1440),
+        ] {
+            let l = Layout::new(w, h);
+            for q in -5..=5 {
+                for r in -5..=5 {
+                    let hex = Hex::new(q, r);
+                    if !hex.on_board() {
+                        continue;
+                    }
+                    let p = l.point(hex, false);
+                    assert!(
+                        p.y - SQRT3 * l.radius / 2. >= 100.,
+                        "header overlap at {w}x{h}: {hex:?}"
+                    );
+                    assert!(
+                        p.y + SQRT3 * l.radius / 2. <= h as f32 - 35.,
+                        "footer overlap at {w}x{h}: {hex:?}"
+                    );
                 }
             }
         }
@@ -1605,23 +1798,68 @@ mod tests {
             assert!(x + y / SQRT3 <= 0.9);
         }
     }
-    #[test]
-    fn local_orders_and_pause_do_not_serialize_armies() {
+    fn fixture_app() -> App {
         let mut app = App::new();
         app.ai = false;
+        app.game = Game::new(game::Position {
+            pieces: [
+                (
+                    Hex::new(0, 5),
+                    Piece {
+                        side: Side::White,
+                        kind: Kind::King,
+                    },
+                ),
+                (
+                    Hex::new(0, -5),
+                    Piece {
+                        side: Side::Black,
+                        kind: Kind::King,
+                    },
+                ),
+                (
+                    Hex::new(0, 3),
+                    Piece {
+                        side: Side::White,
+                        kind: Kind::Rook,
+                    },
+                ),
+                (
+                    Hex::new(2, -3),
+                    Piece {
+                        side: Side::Black,
+                        kind: Kind::Rook,
+                    },
+                ),
+                (
+                    Hex::new(1, 2),
+                    Piece {
+                        side: Side::White,
+                        kind: Kind::Pawn,
+                    },
+                ),
+            ]
+            .into_iter()
+            .collect(),
+        });
         app.game.advance(game::START_DELAY);
-        app.click_hex(Some(Hex::new(0, 4)));
+        app
+    }
+    #[test]
+    fn local_orders_and_pause_preserve_both_players() {
+        let mut app = fixture_app();
+        app.click_hex(Some(Hex::new(0, 3)));
         app.click_hex(Some(Hex::new(0, 0)));
-        app.click_hex(Some(Hex::new(-1, 4)));
-        app.click_hex(Some(Hex::new(-1, 0)));
-        app.click_side(Side::Black, Some(Hex::new(0, -4)));
-        app.click_side(Side::Black, Some(Hex::new(0, 0)));
+        app.click_hex(Some(Hex::new(1, 2)));
+        app.click_hex(Some(Hex::new(1, 1)));
+        app.click_side(Side::Black, Some(Hex::new(2, -3)));
+        app.click_side(Side::Black, Some(Hex::new(2, 0)));
         assert_eq!(app.game.orders().len(), 3);
         let before = app
             .game
             .units()
             .iter()
-            .map(|u| (u.id, u.x, u.y, u.health))
+            .map(|u| (u.id, u.x, u.y))
             .collect::<Vec<_>>();
         app.modal = Modal::Help;
         app.update(10.);
@@ -1630,7 +1868,7 @@ mod tests {
             app.game
                 .units()
                 .iter()
-                .map(|u| (u.id, u.x, u.y, u.health))
+                .map(|u| (u.id, u.x, u.y))
                 .collect::<Vec<_>>()
         );
         app.modal = Modal::None;
@@ -1640,48 +1878,215 @@ mod tests {
             app.game
                 .units()
                 .iter()
-                .map(|u| (u.id, u.x, u.y, u.health))
+                .map(|u| (u.id, u.x, u.y))
                 .collect::<Vec<_>>()
         );
     }
     #[test]
-    fn moving_pieces_can_be_picked_and_selection_tracks_identity() {
-        let mut app = App::new();
-        app.ai = false;
-        app.game.advance(game::START_DELAY);
-        let h = Hex::new(0, 4);
-        let id = app.game.unit_at(h).unwrap().id;
-        app.game
-            .submit(Move {
-                from: h,
-                to: Hex::new(0, 0),
-                promotion: None,
-            })
-            .unwrap();
-        app.selected = Some(h);
-        app.update(1.8);
-        let anchor = app.game.hex_of(id).unwrap();
-        assert_eq!(app.selected, Some(anchor));
-        assert_ne!(anchor, h);
-        let u = app.game.unit_at(anchor).unwrap();
-        let (q, r) = u.axial();
-        let l = Layout::new(1280, 900);
-        for flip in [false, true] {
-            assert_eq!(
-                l.pick(&app.game, l.fractional(q, r, flip), flip),
-                Some(anchor)
-            );
+    fn pointer_hits_are_physical_and_selection_tracks_identity() {
+        for (w, h) in [(1000, 640), (1280, 900), (1600, 1000)] {
+            for flip in [false, true] {
+                let mut app = fixture_app();
+                let source = Hex::new(0, 3);
+                app.click_hex(Some(source));
+                let id = app.selected.unwrap();
+                app.click_hex(Some(Hex::new(0, 0)));
+                app.update(0.6);
+                let l = Layout::new(w, h);
+                let empty = l.point(source, flip);
+                assert_eq!(l.pick(&app.game, empty, flip), None);
+                app.selected = None;
+                app.click_pointer(None, l.hex(empty, flip));
+                assert!(app.selected.is_none());
+                let u = app.game.unit(id).unwrap();
+                let (q, r) = u.axial();
+                let body = l.fractional(q, r, flip);
+                app.click_pointer(l.pick(&app.game, body, flip), l.hex(body, flip));
+                assert_eq!(app.selected, Some(id));
+                app.update(0.6);
+                assert_eq!(app.selected, Some(id));
+                assert_ne!(app.game.unit(id).unwrap().anchor, source);
+            }
         }
     }
     #[test]
-    fn focus_pause_and_bot_army_advance() {
+    fn travel_feedback_explains_full_slots_and_freezes_with_pause() {
+        let mut app = App::new();
+        app.ai = false;
+        app.game.advance(game::START_DELAY);
+        app.click_hex(Some(Hex::new(0, 4)));
+        app.click_hex(Some(Hex::new(0, 3)));
+        let pawn = app.selected.unwrap();
+        assert!(
+            app.travel_hint(app.game.unit(pawn).unwrap())
+                .unwrap()
+                .contains("1.2s")
+        );
+        app.click_hex(Some(Hex::new(1, 3)));
+        app.click_hex(Some(Hex::new(1, 2)));
+        let knight = app
+            .game
+            .units()
+            .iter()
+            .find(|u| u.anchor == Hex::new(-3, 5))
+            .unwrap()
+            .id;
+        assert!(
+            app.travel_hint(app.game.unit(knight).unwrap())
+                .unwrap()
+                .starts_with("Next slot:")
+        );
+        app.update(0.2);
+        let before = app.travel_hint(app.game.unit(pawn).unwrap());
+        app.paused = true;
+        app.update(1.);
+        assert_eq!(app.travel_hint(app.game.unit(pawn).unwrap()), before);
+        app.paused = false;
+        app.update(1.);
+        assert!(app.travel_hint(app.game.unit(knight).unwrap()).is_none());
+    }
+    #[test]
+    fn rejected_command_feedback_survives_landings_and_then_expires() {
+        let mut app = App::new();
+        app.ai = false;
+        app.game.advance(game::START_DELAY);
+        app.click_hex(Some(Hex::new(0, 4)));
+        app.click_hex(Some(Hex::new(0, 3)));
+        app.click_hex(Some(Hex::new(1, 3)));
+        app.click_hex(Some(Hex::new(1, 2)));
+        app.update(1.19);
+        app.click_hex(Some(Hex::new(-3, 5)));
+        app.click_hex(Some(Hex::new(-5, 5)));
+        let rejected = app.notice.clone();
+        assert!(rejected.contains("slots"));
+        app.update(0.02);
+        assert_eq!(app.game.active(Side::White), 0);
+        assert_eq!(app.notice, rejected);
+        app.update(1.5);
+        assert_ne!(app.notice, rejected);
+        assert!(app.notice.contains("arrived"));
+        assert_eq!(app.game.active(Side::White), 0); // No rejected command executes later.
+    }
+    #[test]
+    fn winning_capture_overrides_held_rejection_feedback() {
+        let mut app = App::new();
+        app.ai = false;
+        let mut position = game::Position {
+            pieces: BTreeMap::new(),
+        };
+        for (h, side, kind) in [
+            (Hex::new(0, 5), Side::White, Kind::King),
+            (Hex::new(0, -5), Side::Black, Kind::King),
+            (Hex::new(0, -4), Side::White, Kind::Queen),
+        ] {
+            position.pieces.insert(h, Piece { side, kind });
+        }
+        app.game = Game::new(position);
+        app.game.advance(game::START_DELAY);
+        app.click_hex(Some(Hex::new(0, -4)));
+        app.click_hex(Some(Hex::new(0, -5)));
+        app.click_hex(Some(Hex::new(1, -4)));
+        assert!(app.notice.contains("rejected"));
+        app.update(1.2);
+        assert_eq!(app.game.outcome, Outcome::KingCaptured(Side::White));
+        assert!(!app.notice.contains("rejected"));
+        assert_eq!(app.notice_hold, 0.);
+        let terminal = app.notice.clone();
+        app.update(2.);
+        assert_eq!(app.notice, terminal);
+    }
+    #[test]
+    fn promotion_feedback_shows_the_committed_choice_not_a_changed_preset() {
+        let mut app = App::new();
+        app.ai = false;
+        let pieces = [
+            (
+                Hex::new(0, 5),
+                Piece {
+                    side: Side::White,
+                    kind: Kind::King,
+                },
+            ),
+            (
+                Hex::new(0, -5),
+                Piece {
+                    side: Side::Black,
+                    kind: Kind::King,
+                },
+            ),
+            (
+                Hex::new(-2, -2),
+                Piece {
+                    side: Side::White,
+                    kind: Kind::Pawn,
+                },
+            ),
+        ]
+        .into_iter()
+        .collect();
+        app.game = Game::new(game::Position { pieces });
+        app.game.advance(game::START_DELAY);
+        app.promotion[0] = Kind::Knight;
+        app.game.set_promotion(Side::White, Kind::Knight);
+        app.click_hex(Some(Hex::new(-2, -2)));
+        app.click_hex(Some(Hex::new(-2, -3)));
+        let pawn = app.selected.unwrap();
+        app.promotion[0] = Kind::Queen;
+        app.game.set_promotion(Side::White, Kind::Queen);
+        assert!(
+            app.travel_hint(app.game.unit(pawn).unwrap())
+                .unwrap()
+                .ends_with(" / Knight")
+        );
+        app.update(1.2);
+        assert_eq!(app.game.unit(pawn).unwrap().piece.kind, Kind::Knight);
+    }
+    #[test]
+    fn committed_feedback_keeps_selection_and_does_not_redirect() {
+        let mut app = fixture_app();
+        let source = Hex::new(0, 3);
+        app.click_hex(Some(source));
+        let id = app.selected.unwrap();
+        app.click_hex(Some(Hex::new(0, 0)));
+        app.click_pointer(None, Some(Hex::new(-2, 3)));
+        assert!(app.notice.contains("committed"));
+        assert_eq!(app.game.orders()[0].mv.to, Hex::new(0, 0));
+        assert_eq!(app.selected, Some(id));
+    }
+    #[test]
+    fn easy_cpu_gives_time_to_think_and_level_changes_preserve_the_game() {
+        let mut app = App::new();
+        app.game.advance(game::START_DELAY);
+        app.update(2.39);
+        assert_eq!(app.game.active(Side::Black), 0);
+        app.update(0.02);
+        assert_eq!(app.game.active(Side::Black), 1);
+        let order = app.game.orders()[0];
+        let now = app.game.now();
+        app.cycle_cpu();
+        assert_eq!(app.cpu_level, CpuLevel::Normal);
+        assert_eq!(app.game.now(), now);
+        assert_eq!(app.game.orders()[0].mv, order.mv);
+        assert_eq!(app.ai_wait, 0.);
+        app.paused = true;
+        app.update(10.);
+        assert_eq!(app.game.now(), now);
+        assert_eq!(app.ai_wait, 0.);
+        app.reset();
+        assert_eq!(app.cpu_level, CpuLevel::Normal);
+        assert_eq!(app.game.now(), 0);
+    }
+    #[test]
+    fn focus_pause_and_bot_respect_two_slots() {
         let mut app = App::new();
         app.focus_paused = true;
         app.update(10.);
         assert_eq!(app.game.now(), 0);
         app.focus_paused = false;
-        app.update(3.1);
-        app.update(0.4);
-        assert!(app.game.orders().len() > 1);
+        for _ in 0..450 {
+            app.update(0.02);
+            assert!(app.game.active(Side::Black) <= 2);
+        }
+        assert!(!app.game.moves.is_empty());
     }
 }
