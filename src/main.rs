@@ -1,4 +1,6 @@
 mod game;
+mod mobile;
+mod platform;
 use anyhow::{Context, Result};
 use game::{CpuLevel, Game, Hex, Kind, Move, Outcome, Piece, Side};
 use raylib::prelude::*;
@@ -53,10 +55,16 @@ struct Layout {
     panel_x: i32,
     width: i32,
     height: i32,
+    touch: bool,
+    board: Rectangle,
 }
 impl Layout {
     fn usable(self) -> bool {
-        self.width >= 1000 && self.height >= 640
+        if self.touch {
+            self.width >= 320 && self.radius >= 14. && self.height >= 280
+        } else {
+            self.width >= 1000 && self.height >= 640
+        }
     }
     fn new(w: i32, h: i32) -> Self {
         Self {
@@ -65,6 +73,15 @@ impl Layout {
             panel_x: w - 320,
             width: w,
             height: h,
+            touch: false,
+            board: Rectangle::new(0., 100., (w - 340) as f32, (h - 150) as f32),
+        }
+    }
+    fn accepts_board_point(self, p: Vector2) -> bool {
+        if self.touch {
+            self.board.check_collision_point_rec(p)
+        } else {
+            p.x < (self.panel_x - 20) as f32
         }
     }
     fn point(self, h: Hex, flip: bool) -> Vector2 {
@@ -113,6 +130,7 @@ enum Modal {
     None,
     Help,
     Movement,
+    Controls,
     NewGame,
     Mode,
     Resign(Side),
@@ -125,6 +143,8 @@ struct App {
     black_legal: Vec<Move>,
     black_cursor: Hex,
     inspected: Side,
+    touch_side: Side,
+    help_page: usize,
     promotion: [Kind; 2],
     ai: bool,
     cpu_level: CpuLevel,
@@ -147,6 +167,8 @@ impl App {
             black_legal: vec![],
             black_cursor: Hex::new(0, -4),
             inspected: Side::White,
+            touch_side: Side::White,
+            help_page: 0,
             promotion: [Kind::Queen; 2],
             ai: true,
             cpu_level: CpuLevel::Easy,
@@ -334,14 +356,20 @@ impl App {
     }
     /// Physical hits carry stable identity, not a vacated or shared waypoint key.
     fn click_pointer(&mut self, hit: Option<u64>, tile: Option<Hex>) {
-        if self.frozen() || self.game.outcome != Outcome::Playing {
+        self.click_pointer_for(Side::White, hit, tile);
+    }
+    fn click_pointer_for(&mut self, side: Side, hit: Option<u64>, tile: Option<Hex>) {
+        if (side == Side::Black && self.ai)
+            || self.frozen()
+            || self.game.outcome != Outcome::Playing
+        {
             return;
         }
         if let Some(u) = hit.and_then(|id| self.game.unit(id))
-            && u.piece.side == Side::White
+            && u.piece.side == side
         {
             let id = u.id;
-            self.select(Side::White, Some(id));
+            self.select(side, Some(id));
             return;
         }
         let destination = hit
@@ -349,11 +377,15 @@ impl App {
             .map(|u| u.tile())
             .or(tile);
         if let Some(to) = destination {
-            if !self.order_to(Side::White, to) {
+            if !self.order_to(side, to) {
                 self.feedback("Choose a piece and a legal destination.");
             }
         } else {
-            self.selected = None;
+            if side == Side::White {
+                self.selected = None;
+            } else {
+                self.black_selected = None;
+            }
             self.refresh_selection();
         }
     }
@@ -610,7 +642,10 @@ fn button(
             Color::new(40, 54, 62, 255)
         },
     );
-    let size = 18;
+    let mut size = 18;
+    while size > 12 && d.measure_text(label, size) > rect.width as i32 - 10 {
+        size -= 1;
+    }
     let width = d.measure_text(label, size);
     d.draw_text(
         label,
@@ -658,6 +693,10 @@ fn draw(
     let modal_before = app.modal;
     d.clear_background(BG);
     if !l.usable() {
+        if l.touch {
+            mobile::draw_too_small(d, l);
+            return;
+        }
         d.draw_text("Hex Chess", 24, 24, 30, TEXT);
         wrapped(
             d,
@@ -677,11 +716,23 @@ fn draw(
             18,
             MUTED,
         );
-        d.draw_text("Q: quit", 24, l.height - 40, 18, MUTED);
+        d.draw_text(
+            if cfg!(target_os = "emscripten") {
+                "Q: pause"
+            } else {
+                "Q: quit"
+            },
+            24,
+            l.height - 40,
+            18,
+            MUTED,
+        );
         return;
     }
-    d.draw_text("Hex Chess", 30, 24, 30, TEXT);
-    d.draw_text("Two simultaneous moves per side", 31, 62, 17, MUTED);
+    if !l.touch {
+        d.draw_text("Hex Chess", 30, 24, 30, TEXT);
+        d.draw_text("Two simultaneous moves per side", 31, 62, 17, MUTED);
+    }
     let hover = if app.modal == Modal::None {
         l.hex(mouse, app.flip)
     } else {
@@ -695,10 +746,12 @@ fn draw(
     ];
     let checked = danger[0] || danger[1];
     let mut feedback = app.notice.clone();
-    while d.measure_text(&feedback, 14) > l.panel_x - 65 {
+    while !l.touch && !feedback.is_empty() && d.measure_text(&feedback, 14) > l.panel_x - 65 {
         feedback.pop();
     }
-    d.draw_text(&feedback, 31, 84, 14, MUTED);
+    if !l.touch {
+        d.draw_text(&feedback, 31, 84, 14, MUTED);
+    }
     for q in -5..=5 {
         for r in -5..=5 {
             let h = Hex::new(q, r);
@@ -757,7 +810,8 @@ fn draw(
                     );
                 }
             }
-            if (q.abs() == 5 || r.abs() == 5 || (q + r).abs() == 5)
+            if !l.touch
+                && (q.abs() == 5 || r.abs() == 5 || (q + r).abs() == 5)
                 && !app.game.position.pieces.contains_key(&h)
             {
                 d.draw_text(
@@ -821,6 +875,13 @@ fn draw(
             2.,
             Color::new(134, 181, 240, 255),
         );
+    }
+    if l.touch {
+        mobile::draw_panel(app, d, l, mouse, click, danger);
+        if app.modal != Modal::None {
+            mobile::draw_modal(app, d, l, mouse, click && modal_before == app.modal);
+        }
+        return;
     }
     let x = l.panel_x;
     d.draw_rectangle(x - 15, 20, 310, l.height - 40, PANEL);
@@ -1080,7 +1141,11 @@ fn draw(
     );
     d.draw_text(
         if app.ai {
-            "2 move slots / Esc: clear / Q: quit"
+            if cfg!(target_os = "emscripten") {
+                "2 move slots / Esc: clear / Q: pause"
+            } else {
+                "2 move slots / Esc: clear / Q: quit"
+            }
         } else {
             "Black: arrows + , . / Space"
         },
@@ -1240,7 +1305,11 @@ fn draw_modal(
                     ),
                     (
                         "LOCAL PLAY / PAUSE",
-                        "White: mouse. Black: arrows, comma/period and Space. P, menus and focus loss pause. Check is a warning, not a forced response. Q quits.",
+                        if cfg!(target_os = "emscripten") {
+                            "White: mouse. Black: arrows, comma/period and Space. P, menus and focus loss pause. Check is a warning, not a forced response. Q pauses."
+                        } else {
+                            "White: mouse. Black: arrows, comma/period and Space. P, menus and focus loss pause. Check is a warning, not a forced response. Q quits."
+                        },
                     ),
                 ];
                 for (i, (heading, body)) in lines.iter().enumerate() {
@@ -1340,6 +1409,15 @@ fn confirm(app: &mut App) {
 fn bounded_viewport(requested: (i32, i32), actual: (i32, i32)) -> (i32, i32) {
     (requested.0.min(actual.0), requested.1.min(actual.1))
 }
+// Fields drop in declaration order: GPU assets must die before the window/context.
+// Keeping this owner intact also prevents closure capture order from reversing cleanup.
+struct Renderer {
+    font: Font,
+    textures: BTreeMap<(Side, Kind), Texture2D>,
+    rl: RaylibHandle,
+    thread: RaylibThread,
+}
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let demo = args.iter().any(|s| s == "--demo");
@@ -1379,8 +1457,12 @@ fn main() -> Result<()> {
         .resizable()
         .msaa_4x()
         .build();
+    #[cfg(not(target_os = "emscripten"))]
     rl.set_window_min_size(1000, 640);
+    #[cfg(not(target_os = "emscripten"))]
     rl.set_target_fps(60);
+    #[cfg(target_os = "emscripten")]
+    rl.set_target_fps(0); // requestAnimationFrame supplies browser pacing; never sleep in a callback.
     rl.set_exit_key(None);
     let textures = textures(&mut rl, &thread)?;
     let font = rl
@@ -1388,7 +1470,11 @@ fn main() -> Result<()> {
             &thread,
             ".ttf",
             include_bytes!("../assets/fonts/AdwaitaSans-Regular.ttf"),
-            64,
+            if cfg!(target_os = "emscripten") {
+                128
+            } else {
+                64
+            },
             None,
         )
         .context("Load interface font")?;
@@ -1397,21 +1483,91 @@ fn main() -> Result<()> {
     let mut app = App::new();
     let mut frame = 0;
     let mut undersized_frames = 0;
-    while !rl.window_should_close() {
-        let dt = if demo {
-            1. / 60.
-        } else {
-            rl.get_frame_time().min(0.1)
-        };
+    #[cfg(target_os = "emscripten")]
+    let mut last_frame_at = std::time::Instant::now();
+    #[cfg(target_os = "emscripten")]
+    let mut previously_focused = false;
+    let mut renderer = Renderer {
+        font,
+        textures,
+        rl,
+        thread,
+    };
+    platform::run_frames(move || {
+        let Renderer {
+            font,
+            textures,
+            rl,
+            thread,
+        } = &mut renderer;
+        #[cfg(not(target_os = "emscripten"))]
+        if rl.window_should_close() {
+            return Ok(false);
+        }
+        #[cfg(target_os = "emscripten")]
+        let viewport = platform::viewport();
+        #[cfg(target_os = "emscripten")]
+        {
+            let (w, h) = viewport.framebuffer();
+            if (w, h) != (rl.get_screen_width(), rl.get_screen_height()) {
+                rl.set_window_size(w, h);
+                // GLFW may rewrite inline CSS while changing its backing dimensions.
+                platform::sync_canvas_css_size();
+            }
+        }
+        #[cfg(not(target_os = "emscripten"))]
         let actual = (rl.get_screen_width(), rl.get_screen_height());
+        #[cfg(target_os = "emscripten")]
+        let actual = (viewport.width, viewport.height);
         let (w, h) = audit_size.map_or(actual, |requested| bounded_viewport(requested, actual));
+        #[cfg(not(target_os = "emscripten"))]
         let l = Layout::new(w, h);
-        app.focus_paused = !demo && !rl.is_window_focused();
+        #[cfg(target_os = "emscripten")]
+        let l = if viewport.touch {
+            Layout::for_touch(w, h)
+        } else {
+            Layout::new(w, h)
+        };
+        #[cfg(not(target_os = "emscripten"))]
+        let focused = rl.is_window_focused();
+        #[cfg(target_os = "emscripten")]
+        let focused = platform::focused();
+        #[cfg(not(target_os = "emscripten"))]
+        let dt = rl.get_frame_time().min(0.1);
+        #[cfg(target_os = "emscripten")]
+        let dt = {
+            let now = std::time::Instant::now();
+            let elapsed = now.duration_since(last_frame_at).as_secs_f32();
+            last_frame_at = now;
+            // A hidden tab may stop callbacks entirely. Never count that gap on refocus,
+            // nor use Raylib's EndDrawing time (which reports the gap one frame late).
+            let reset_clock = platform::take_clock_reset();
+            let dt = if focused && previously_focused && !reset_clock {
+                elapsed.min(0.1)
+            } else {
+                0.
+            };
+            previously_focused = focused;
+            dt
+        };
+        let dt = if demo { 1. / 60. } else { dt };
+        app.focus_paused = !demo && !focused;
         let modal_at_frame_start = app.modal;
         let mouse = rl.get_mouse_position();
+        #[cfg(target_os = "emscripten")]
+        let mouse = mouse / viewport.density;
         let click = rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_LEFT);
+        #[cfg(target_os = "emscripten")]
+        let tap = platform::take_touch_tap();
+        #[cfg(target_os = "emscripten")]
+        let (mouse, click) = tap.map_or((mouse, click), |(x, y)| (Vector2::new(x, y), true));
         if rl.is_key_pressed(KeyboardKey::KEY_Q) {
-            break;
+            #[cfg(not(target_os = "emscripten"))]
+            return Ok(false);
+            #[cfg(target_os = "emscripten")]
+            {
+                app.paused = true;
+            }
         }
         if rl.is_key_pressed(KeyboardKey::KEY_ESCAPE) {
             app.modal = Modal::None;
@@ -1492,8 +1648,23 @@ fn main() -> Result<()> {
                     app.black_legal.clear();
                 }
             }
-            if click && mouse.x < (l.panel_x - 20) as f32 {
-                app.click_pointer(l.pick(&app.game, mouse, app.flip), l.hex(mouse, app.flip));
+            if click && l.accepts_board_point(mouse) {
+                let mut hit = l.pick(&app.game, mouse, app.flip);
+                let tile = l.hex(mouse, app.flip);
+                if l.touch && hit.is_none() {
+                    // A stationary piece owns its entire hex touch target, not just its art.
+                    hit = app
+                        .game
+                        .units()
+                        .iter()
+                        .find(|u| !u.marching() && Some(u.tile()) == tile)
+                        .map(|u| u.id);
+                }
+                if l.touch {
+                    app.click_pointer_for(app.touch_side, hit, tile);
+                } else {
+                    app.click_pointer(hit, tile);
+                }
             }
             if rl.is_mouse_button_pressed(MouseButton::MOUSE_BUTTON_RIGHT) {
                 app.selected = None;
@@ -1515,14 +1686,25 @@ fn main() -> Result<()> {
         }
         {
             let draw_click = click && app.modal == modal_at_frame_start;
-            let mut d = rl.begin_drawing(&thread);
+            let mut d = rl.begin_drawing(thread);
+            #[cfg(target_os = "emscripten")]
+            unsafe {
+                // Draw in logical CSS coordinates into the larger device-pixel framebuffer.
+                // Use the raw mode pair here to retain Canvas's shared drawing/font interface.
+                raylib::ffi::BeginMode2D(
+                    Camera2D {
+                        offset: Vector2::zero(),
+                        target: Vector2::zero(),
+                        rotation: 0.,
+                        zoom: viewport.density,
+                    }
+                    .into(),
+                );
+            }
             draw(
                 &mut app,
-                &mut Canvas {
-                    draw: &mut d,
-                    font: &font,
-                },
-                &textures,
+                &mut Canvas { draw: &mut d, font },
+                textures,
                 l,
                 mouse,
                 draw_click,
@@ -1534,11 +1716,7 @@ fn main() -> Result<()> {
                     _ => None,
                 };
                 if let Some(label) = fixture {
-                    Canvas {
-                        draw: &mut d,
-                        font: &font,
-                    }
-                    .draw_text(
+                    Canvas { draw: &mut d, font }.draw_text(
                         label,
                         80,
                         h - 25,
@@ -1547,6 +1725,10 @@ fn main() -> Result<()> {
                     );
                 }
             }
+            #[cfg(target_os = "emscripten")]
+            unsafe {
+                raylib::ffi::EndMode2D()
+            };
         }
         if let Some(path) = &capture
             && ((!capture_on_demand && frame % 3 == 0)
@@ -1575,11 +1757,8 @@ fn main() -> Result<()> {
         if !demo || l.usable() {
             frame += 1;
         }
-        if demo && frame >= 1800 {
-            break;
-        }
-    }
-    Ok(())
+        Ok(!(demo && frame >= 1800))
+    })
 }
 /// Deterministic rendered audit, including clearly labelled artificial rule fixtures.
 fn demo_step(app: &mut App, frame: u32) {

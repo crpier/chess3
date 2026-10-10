@@ -1,2 +1,5 @@
 /target
 /artifacts
+
+/.playwright-mcp
+/node_modules

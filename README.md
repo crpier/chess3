@@ -1,12 +1,84 @@
 # Real-time Hex Chess
 
-A desktop hex-chess house variant built with Rust and Raylib. **Two committed moves per side** may travel concurrently. Moves begin immediately, pieces travel continuously, and interceptions happen on the board. There are no alternating turns, but this is deliberately **not an army-control RTS**.
+A native and desktop/mobile-browser hex-chess house variant built with Rust and Raylib. **Two committed moves per side** may travel concurrently. Moves begin immediately, pieces travel continuously, and interceptions happen on the board. There are no alternating turns, but this is deliberately **not an army-control RTS**.
 
 ```sh
 cargo run --release
 ```
 
-Piece art and readable **Adwaita Sans** are embedded. Font license: `assets/fonts/LICENSE`. Minimum playable window: **1000 × 640**; smaller windows pause and show a resize message.
+Piece art and readable **Adwaita Sans** are embedded. Font license: `assets/fonts/LICENSE`. Minimum native/desktop playable window: **1000 × 640**; smaller windows pause and show a resize message.
+
+## Browser build
+
+The same Rust rules and Raylib renderer compile to **WebAssembly with Emscripten**. The web page keeps CPU levels, local two-player controls, move previews and readiness indicators. Click the canvas to focus; Tab leaves it and pauses play. Hidden tabs and browser focus loss also pause, with elapsed wall time discarded on return. **Q pauses rather than quitting** in the browser. Fullscreen uses the page's button.
+
+Rendering follows the browser’s device-pixel ratio (up to 4×), including live zoom/display-scale changes. The board layout and input stay in CSS pixels; a 1000×640 canvas on a 2× display renders at 2000×1280 rather than stretching a low-resolution image. The web font atlas is also sized for high-DPI text.
+
+Desktop mouse/keyboard layout needs at least **1000 × 640** CSS canvas pixels, in addition to the page header/footer. Touch browsers use a separate responsive layout rather than shrinking desktop text. Refreshing closes the current game: no persistence or online multiplayer is added. Chromium and Chromium touch emulation have been tested; real Android/iOS hardware, Firefox and Safari still need compatibility smoke tests.
+
+### Mobile play
+
+On a browser whose primary pointer is touch, portrait uses the full-width board and bottom controls; landscape uses a compact side panel. Buttons are at least **44 CSS pixels high**. Phone and tablet layouts keep the full 91-tile board, legal previews, both sides’ slot counts/readiness, king warnings, current feedback, and high-DPI rendering. Tiny viewports pause rather than clip the board. **Portrait is recommended on small phones**; a 320×568 phone fits in portrait, but its short landscape viewport needs fullscreen or rotation back to portrait. Safe-area insets and dynamic viewport height are respected.
+
+- **Tap a piece, then a legal destination.** Stationary pieces accept their full hex as a touch target. Commands happen on a completed single-finger tap; drags, multi-touch and cancelled gestures do not order moves. Fast taps are retained until a frame processes them, not lost between frames. This is input delivery, not a gameplay move queue: the same two-slot/immutable-order rules still reject unavailable orders.
+- **Pause / Resume** is always visible. **CPU: Easy** cycles difficulty; Easy remains the default.
+- **Menu** provides flip, clear selection, new game, mode change, rules, piece-movement pages, promotion preset and resignation. New/mode/resign require confirmation. Menus pause the match.
+- In local two-player mode, **Touch: White / Black** selects which side your taps control. This is shared-device simultaneous chess, **not alternating turns or online multiplayer**. Switching touch side never cancels existing orders; the selected side also owns the promotion/resign controls.
+- Background/focus interruptions pause the game and discard elapsed wall time. Fullscreen is optional; unavailable fullscreen produces a message, not a gameplay dependency. Real mobile tab/app switching still needs a device smoke test.
+
+To try a phone on the **same trusted LAN**, serve the existing build bound to your PC’s private LAN address, not `127.0.0.1` (which means the phone itself when opened there):
+
+```sh
+# Replace this example with the PC's current LAN address.
+npx --yes http-server@14.1.1 target/web -a 192.168.1.138 -p 8080 -c-1
+```
+
+Open **http://192.168.1.138:8080/** on the phone. Keep the terminal/server running; Ctrl+C stops it and reboot stops it. This makes the static game available to that LAN, not a published site. Do not port-forward it or change firewall rules just to test. PC/phone guest-network isolation or a firewall may prevent access. Browser fullscreen availability and safe-area behavior vary by mobile browser.
+
+### Build and serve locally
+
+Install/activate an Emscripten SDK (tested with **4.0.20**), plus Rust, CMake and the usual native build dependencies. For example, keeping the SDK in ignored project artifacts:
+
+```sh
+mkdir -p artifacts/toolchains
+git clone --depth 1 https://github.com/emscripten-core/emsdk.git artifacts/toolchains/emsdk
+artifacts/toolchains/emsdk/emsdk install 4.0.20
+artifacts/toolchains/emsdk/emsdk activate 4.0.20
+source artifacts/toolchains/emsdk/emsdk_env.sh
+rustup target add wasm32-unknown-emscripten
+./scripts/build-web.sh
+npx --yes http-server@14.1.1 target/web -a 127.0.0.1 -p 8080 -c-1
+```
+
+Open **http://127.0.0.1:8080/**. Use HTTP rather than opening `index.html` as a local file. Subsequent builds only need SDK activation and `./scripts/build-web.sh`; the native `cargo run --release` is unchanged.
+
+`target/web/` contains the four static deployment files: `index.html`, `host.js`, `chess3.js`, and `chess3.wasm` (about **1.8 MB total**, before HTTP compression). They can be hosted together at a site root or subdirectory on GitHub Pages, Cloudflare Pages or itch.io; serve `.wasm` as `application/wasm`. No backend, credentials, shared-memory isolation headers, or runtime CDN dependencies are required. Hosting/publishing is not performed by the build script.
+
+### Isolated headless browser verification
+
+```sh
+npm ci
+npx playwright install chromium
+npm run test:web-host
+npm run test:web
+```
+
+Alternatively, use an existing Chromium executable **in its own isolated headless profile**, not your desktop session:
+
+```sh
+WEB_CHROMIUM=/usr/bin/chromium npm run test:web
+```
+
+The headless audit starts a loopback server on a free port, uses real mouse/keyboard/touch events, and checks canvas screenshots through ImageMagick/Tesseract OCR. These two tools are required. It runs at 1× and 2× pixel density, checks the actual backing resolution, and switches live to 1.25× to verify fractional scaling and click alignment. It verifies the countdown, selection/readiness, human movement, an Easy CPU reply, level changes, rules, simultaneous White/Black orders, manual/focus pause, Tab escape, ignored off-canvas commands, compact/undersized resizing, Q and fullscreen. Paused captures must be byte-identical; browser errors fail the run. The mobile suite covers 390×844 at 3× density, 320×568, 844×390 and a 768×1024 tablet at 2×: completed/fast taps, full-hex selection, ignored drag/multi-touch/cancel gestures, CPU play/levels, manual/focus pause, paginated rules/movement, promotion, flip, both local sides, confirmations and cancellation, rotation, Black resignation, fullscreen and too-small recovery. Evidence goes to fresh `artifacts/web/headless-*` directories. Browser and test server close even on failure. Your normal browser, accounts and desktop focus are untouched.
+
+The combined audit takes several minutes (especially with software WebGL). Run a subset when iterating:
+
+```sh
+WEB_AUDIT=desktop WEB_CHROMIUM=/usr/bin/chromium npm run test:web
+WEB_AUDIT=mobile WEB_CHROMIUM=/usr/bin/chromium npm run test:web
+WEB_AUDIT=mobile WEB_MOBILE_CASE=small-phone WEB_CHROMIUM=/usr/bin/chromium npm run test:web
+# Mobile cases: phone, small-phone, landscape-phone, tablet.
+```
 
 ## Deliberate plays, not a spamfest
 
@@ -121,6 +193,10 @@ For occasional native-input captures, use `--capture-dir PATH --capture-on-deman
 ## Code
 
 - `src/game.rs`: piece geometry, fixed-step travel, commitments, reservations, captures, identities, outcomes and simple bot.
+- `src/platform.rs`: native frame loop and browser animation-frame scheduling/focus bridge.
+- `web/`: static canvas host, focus/keyboard/fullscreen handling and host unit tests.
+- `scripts/build-web.sh`: Emscripten build and static bundle.
+- `scripts/audit-web.mjs`, `scripts/browser-input-test.js`, `scripts/check-web-captures.sh`: isolated headless input and rendered-HUD assertions.
 - `src/main.rs`: physical picking, stable selections, independent controls, rendering, pause/layout, embedded assets and visual audit.
 - `scripts/record-demo.sh`: repeatable screenshot/video recording.
 - `scripts/audit-native.sh`, `scripts/native-input-test.c`, `scripts/check-native-captures.sh`: isolated native inputs, fresh complete captures, and assertions on the rendered HUD.

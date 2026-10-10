@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Hex Chess</title>
+  <link rel="icon" href="data:,">
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background: #131b23; color: #e8ece8; }
+    * { box-sizing: border-box; }
+    body { margin: 0; height: 100dvh; display: flex; flex-direction: column; overflow: hidden; }
+    header { display: flex; align-items: center; gap: 20px; padding: 10px 24px; flex: 0 0 auto; }
+    h1 { font-size: 18px; margin: 0; font-weight: 600; }
+    #status { flex: 1; font-size: 14px; color: #95a9b1; }
+    button { font: inherit; font-size: 14px; color: #e8ece8; background: #1d2832; border: 1px solid #526570; border-radius: 5px; padding: 7px 12px; cursor: pointer; }
+    button:focus-visible, canvas:focus-visible { outline: 2px solid #6fd3b3; outline-offset: -2px; }
+    #stage { flex: 1 1 auto; min-height: 0; width: 100%; overflow: hidden; }
+    canvas { display: block; border: 0; }
+    footer { flex: 0 0 auto; padding: 8px 24px; font-size: 13px; color: #95a9b1; }
+    body:fullscreen header, body:fullscreen footer { display: none; }
+    @media (pointer: coarse) {
+      body { padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left); }
+      header { min-height: 56px; padding: 6px 8px; gap: 8px; }
+      h1 { font-size: 16px; }
+      #status { font-size: 12px; }
+      button { min-height: 44px; }
+      canvas { touch-action: none; -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; }
+      footer { display: none; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Hex Chess</h1>
+    <span id="status" role="status">Loading game…</span>
+    <button id="fullscreen" type="button">Fullscreen</button>
+  </header>
+  <main id="stage" aria-label="Hex Chess game">
+    <canvas id="canvas" width="1280" height="900" tabindex="0" aria-label="Game board. Tap or click a piece, then a destination. Touch controls include Pause, CPU or side selection, and Menu. Keyboard: H rules, P pause, C difficulty."></canvas>
+  </main>
+  <footer>Desktop browser · White: mouse · P: pause · H: rules · C: CPU level · Click the board to focus. Tab away to pause.</footer>
+  <script src="host.js"></script>
+  <script src="chess3.js" async onerror="Module.setStatus('Could not load the game. Reload to retry.')"></script>
+</body>
+</html>

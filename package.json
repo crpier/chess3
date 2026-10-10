@@ -1,0 +1,12 @@
+{
+  "name": "hex-chess-web-tools",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test:web-host": "node --test web/host.test.mjs",
+    "test:web": "node scripts/audit-web.mjs"
+  },
+  "devDependencies": {
+    "playwright": "1.64.0"
+  }
+}
